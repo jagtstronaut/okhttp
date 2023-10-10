@@ -44,6 +44,7 @@ import okhttp3.internal.http.BridgeInterceptor
 import okhttp3.internal.http.CallServerInterceptor
 import okhttp3.internal.http.RealInterceptorChain
 import okhttp3.internal.http.RetryAndFollowUpInterceptor
+import okhttp3.internal.http2.StreamResetException
 import okhttp3.internal.platform.Platform
 import okhttp3.internal.threadName
 import okio.AsyncTimeout
