@@ -19,6 +19,7 @@ import java.io.IOException
 import java.io.InterruptedIOException
 import java.lang.ref.WeakReference
 import java.net.Socket
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit.MILLISECONDS
@@ -46,7 +47,9 @@ import okhttp3.internal.http.RealInterceptorChain
 import okhttp3.internal.http.RetryAndFollowUpInterceptor
 import okhttp3.internal.platform.Platform
 import okhttp3.internal.threadName
+import okhttp3.internal.http2.StreamResetException
 import okio.AsyncTimeout
+import okio.Timeout
 
 /**
  * Bridge between OkHttp's application and network layers. This class exposes high-level application
@@ -62,7 +65,7 @@ class RealCall(
   /** The application's original request unadulterated by redirects or auth headers. */
   val originalRequest: Request,
   val forWebSocket: Boolean
-) : Call {
+) : Call, Cloneable {
   private val connectionPool: RealConnectionPool = client.connectionPool.delegate
 
   internal val eventListener: EventListener = client.eventListenerFactory.create(this)
@@ -114,12 +117,12 @@ class RealCall(
 
   @Volatile private var canceled = false
   @Volatile private var exchange: Exchange? = null
-  @Volatile var connectionToCancel: RealConnection? = null
+  internal val plansToCancel = CopyOnWriteArrayList<RoutePlanner.Plan>()
 
-  override fun timeout() = timeout
+  override fun timeout(): Timeout = timeout
 
   @SuppressWarnings("CloneDoesntCallSuperClone") // We are a final type & this saves clearing state.
-  override fun clone() = RealCall(client, originalRequest, forWebSocket)
+  override fun clone(): Call = RealCall(client, originalRequest, forWebSocket)
 
   override fun request(): Request = originalRequest
 
@@ -137,12 +140,14 @@ class RealCall(
 
     canceled = true
     exchange?.cancel()
-    connectionToCancel?.cancel()
+    for (plan in plansToCancel) {
+      plan.cancel()
+    }
 
     eventListener.canceled(this)
   }
 
-  override fun isCanceled() = canceled
+  override fun isCanceled(): Boolean = canceled
 
   override fun execute(): Response {
     check(executed.compareAndSet(false, true)) { "Already Executed" }
@@ -186,14 +191,14 @@ class RealCall(
     interceptors += CallServerInterceptor(forWebSocket)
 
     val chain = RealInterceptorChain(
-        call = this,
-        interceptors = interceptors,
-        index = 0,
-        exchange = null,
-        request = originalRequest,
-        connectTimeoutMillis = client.connectTimeoutMillis,
-        readTimeoutMillis = client.readTimeoutMillis,
-        writeTimeoutMillis = client.writeTimeoutMillis
+      call = this,
+      interceptors = interceptors,
+      index = 0,
+      exchange = null,
+      request = originalRequest,
+      connectTimeoutMillis = client.connectTimeoutMillis,
+      readTimeoutMillis = client.readTimeoutMillis,
+      writeTimeoutMillis = client.writeTimeoutMillis
     )
 
     var calledNoMoreExchanges = false
@@ -220,26 +225,35 @@ class RealCall(
    *
    * Note that an exchange will not be needed if the request is satisfied by the cache.
    *
-   * @param newExchangeFinder true if this is not a retry and new routing can be performed.
+   * @param newRoutePlanner true if this is not a retry and new routing can be performed.
    */
-  fun enterNetworkInterceptorExchange(request: Request, newExchangeFinder: Boolean) {
+  fun enterNetworkInterceptorExchange(
+    request: Request,
+    newRoutePlanner: Boolean,
+    chain: RealInterceptorChain,
+  ) {
     check(interceptorScopedExchange == null)
 
     synchronized(this) {
       check(!responseBodyOpen) {
         "cannot make a new request because the previous response is still open: " +
-            "please call response.close()"
+          "please call response.close()"
       }
       check(!requestBodyOpen)
     }
 
-    if (newExchangeFinder) {
-      this.exchangeFinder = ExchangeFinder(
-          connectionPool,
-          createAddress(request.url),
-          this,
-          eventListener
+    if (newRoutePlanner) {
+      val routePlanner = RealRoutePlanner(
+        client,
+        createAddress(request.url),
+        this,
+        chain,
+        connectionListener = connectionPool.connectionListener
       )
+      this.exchangeFinder = when {
+        client.fastFallback -> FastFallbackExchangeFinder(routePlanner, client.taskRunner)
+        else -> SequentialExchangeFinder(routePlanner)
+      }
     }
   }
 
@@ -252,7 +266,8 @@ class RealCall(
     }
 
     val exchangeFinder = this.exchangeFinder!!
-    val codec = exchangeFinder.find(client, chain)
+    val connection = exchangeFinder.find()
+    val codec = connection.newCodec(client, chain)
     val result = Exchange(this, eventListener, exchangeFinder, codec)
     this.interceptorScopedExchange = result
     this.exchange = result
@@ -346,14 +361,19 @@ class RealCall(
     val connection = this.connection
     if (connection != null) {
       connection.assertThreadDoesntHoldLock()
-      val socket = synchronized(connection) {
-        releaseConnectionNoEvents() // Sets this.connection to null.
+      val toClose: Socket? = synchronized(connection) {
+        // Sets this.connection to null.
+        releaseConnectionNoEvents()
       }
       if (this.connection == null) {
-        socket?.closeQuietly()
+        toClose?.closeQuietly()
         eventListener.connectionReleased(this, connection)
+        connection.connectionListener.connectionReleased(connection, this)
+        if (toClose != null) {
+          connection.connectionListener.connectionClosed(connection)
+        }
       } else {
-        check(socket == null) // If we still have a connection we shouldn't be closing any sockets.
+        check(toClose == null) // If we still have a connection we shouldn't be closing any sockets.
       }
     }
 
@@ -438,22 +458,25 @@ class RealCall(
     }
 
     return Address(
-        uriHost = url.host,
-        uriPort = url.port,
-        dns = client.dns,
-        socketFactory = client.socketFactory,
-        sslSocketFactory = sslSocketFactory,
-        hostnameVerifier = hostnameVerifier,
-        certificatePinner = certificatePinner,
-        proxyAuthenticator = client.proxyAuthenticator,
-        proxy = client.proxy,
-        protocols = client.protocols,
-        connectionSpecs = client.connectionSpecs,
-        proxySelector = client.proxySelector
+      uriHost = url.host,
+      uriPort = url.port,
+      dns = client.dns,
+      socketFactory = client.socketFactory,
+      sslSocketFactory = sslSocketFactory,
+      hostnameVerifier = hostnameVerifier,
+      certificatePinner = certificatePinner,
+      proxyAuthenticator = client.proxyAuthenticator,
+      proxy = client.proxy,
+      protocols = client.protocols,
+      connectionSpecs = client.connectionSpecs,
+      proxySelector = client.proxySelector
     )
   }
 
-  fun retryAfterFailure() = exchangeFinder!!.retryAfterFailure()
+  fun retryAfterFailure(): Boolean {
+    return exchange?.hasFailure == true &&
+      exchangeFinder!!.routePlanner.hasNext(exchange?.connection)
+  }
 
   /**
    * Returns a string that describes this call. Doesn't include a full URL as that might contain
@@ -461,16 +484,19 @@ class RealCall(
    */
   private fun toLoggableString(): String {
     return ((if (isCanceled()) "canceled " else "") +
-        (if (forWebSocket) "web socket" else "call") +
-        " to " + redactedUrl())
+      (if (forWebSocket) "web socket" else "call") +
+      " to " + redactedUrl())
   }
 
   internal fun redactedUrl(): String = originalRequest.url.redact()
 
-  internal inner class AsyncCall(
+  inner class AsyncCall(
     private val responseCallback: Callback
   ) : Runnable {
     @Volatile var callsPerHost = AtomicInteger(0)
+      private set
+
+    var retry: Boolean = true
       private set
 
     fun reuseCallsPerHostFrom(other: AsyncCall) {
@@ -481,10 +507,10 @@ class RealCall(
       get() = originalRequest.url.host
 
     val request: Request
-        get() = originalRequest
+      get() = originalRequest
 
     val call: RealCall
-        get() = this@RealCall
+      get() = this@RealCall
 
     /**
      * Attempt to enqueue this async call on [executorService]. This will attempt to clean up
@@ -498,15 +524,19 @@ class RealCall(
         executorService.execute(this)
         success = true
       } catch (e: RejectedExecutionException) {
-        val ioException = InterruptedIOException("executor rejected")
-        ioException.initCause(e)
-        noMoreExchanges(ioException)
-        responseCallback.onFailure(this@RealCall, ioException)
+        failRejected(e)
       } finally {
         if (!success) {
           client.dispatcher.finished(this) // This call is no longer running!
         }
       }
+    }
+
+    internal fun failRejected(e: RejectedExecutionException? = null) {
+      val ioException = InterruptedIOException("executor rejected")
+      ioException.initCause(e)
+      noMoreExchanges(ioException)
+      responseCallback.onFailure(this@RealCall, ioException)
     }
 
     override fun run() {
@@ -523,6 +553,12 @@ class RealCall(
             Platform.get().log("Callback failure for ${toLoggableString()}", Platform.INFO, e)
           } else {
             responseCallback.onFailure(this@RealCall, e)
+          }
+        } catch (e: StreamResetException) {
+          // Retry stream reset exception one time
+          if (this.retry) {
+            this.retry = false
+            run()
           }
         } catch (t: Throwable) {
           cancel()
