@@ -472,6 +472,9 @@ class RealCall(
   ) : Runnable {
     @Volatile var callsPerHost = AtomicInteger(0)
       private set
+    
+    var retry: Boolean = true
+      private set
 
     fun reuseCallsPerHostFrom(other: AsyncCall) {
       this.callsPerHost = other.callsPerHost
@@ -524,7 +527,13 @@ class RealCall(
           } else {
             responseCallback.onFailure(this@RealCall, e)
           }
-        } catch (t: Throwable) {
+        } catch (e: StreamResetException) {
+          // Retry stream reset exception one time
+          if (this.retry) {
+            this.retry = false
+            run()
+          }
+        }catch (t: Throwable) {
           cancel()
           if (!signalledCallback) {
             val canceledException = IOException("canceled due to $t")
