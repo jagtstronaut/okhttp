@@ -44,6 +44,7 @@ import okhttp3.internal.http.BridgeInterceptor
 import okhttp3.internal.http.CallServerInterceptor
 import okhttp3.internal.http.RealInterceptorChain
 import okhttp3.internal.http.RetryAndFollowUpInterceptor
+import okhttp3.internal.http2.StreamResetException
 import okhttp3.internal.platform.Platform
 import okhttp3.internal.threadName
 import okio.AsyncTimeout
@@ -471,6 +472,8 @@ class RealCall(
     private val responseCallback: Callback
   ) : Runnable {
     @Volatile var callsPerHost = AtomicInteger(0)
+
+    var retry: Boolean = true
       private set
 
     fun reuseCallsPerHostFrom(other: AsyncCall) {
@@ -512,6 +515,7 @@ class RealCall(
     override fun run() {
       threadName("OkHttp ${redactedUrl()}") {
         var signalledCallback = false
+
         timeout.enter()
         try {
           val response = getResponseWithInterceptorChain()
@@ -524,7 +528,13 @@ class RealCall(
           } else {
             responseCallback.onFailure(this@RealCall, e)
           }
-        } catch (t: Throwable) {
+        } catch (e: StreamResetException) {
+          // Retry stream reset exception one time
+          if (retry) {
+            retry = false
+            run()
+          }
+      } catch (t: Throwable) {
           cancel()
           if (!signalledCallback) {
             val canceledException = IOException("canceled due to $t")
