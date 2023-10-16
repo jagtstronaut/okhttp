@@ -543,6 +543,7 @@ class RealCall(
           }
           throw t
         } finally {
+          retry = true
           client.dispatcher.finished(this)
         }
       }
